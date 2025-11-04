@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 TELEGRAM_TOKEN=os.getenv("TELEGRAM_TOKEN")
 CHAT_ID=os.getenv("CHAT_ID")
-MEXC="https://contract.mexc.com"
+MEXC="https://api.mexc.com"
 
 def ts(): return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -45,20 +45,20 @@ def volume_spike(df, n=10, r=1.15):
     ratio=float(t.iloc[-1]/(base.iloc[-2]+1e-12))
     return ratio>=r, ratio
 
-# --- mexc işlemleri ---
-def mexc_symbols():
-    d=jget(f"{MEXC}/api/v1/contract/detail")
-    if not d or "data" not in d: return []
-    coins=[s for s in d["data"] if s.get("quoteCoin")=="USDT"]
-    coins=sorted(coins, key=lambda x: x.get("turnover",0), reverse=True)
-    return [c["symbol"] for c in coins[:150]]  # sadece en likit 150 coin
+# --- mexc spot işlemleri ---
+def mexc_spot_symbols(limit=150):
+    d=jget(f"{MEXC}/api/v3/ticker/24hr")
+    if not d: return []
+    coins=[x for x in d if x.get("symbol","").endswith("USDT")]
+    coins=sorted(coins, key=lambda x: float(x.get("quoteVolume",0)), reverse=True)
+    return [c["symbol"] for c in coins[:limit]]
 
 def klines(sym, interval, limit=120):
-    d=jget(f"{MEXC}/api/v1/contract/kline/{sym}",{"interval":interval,"limit":limit})
-    if not d or "data" not in d: return None
+    d=jget(f"{MEXC}/api/v3/klines",{"symbol":sym,"interval":interval,"limit":limit})
+    if not d: return None
     try:
-        df=pd.DataFrame(d["data"],columns=["ts","open","high","low","close","volume","turnover"]).astype(float)
-        df.columns=["ts","o","h","l","c","v","t"]
+        df=pd.DataFrame(d,columns=["ts","o","h","l","c","v","qv","n","t1","t2","ig","ib"]).astype(float)
+        df["turnover"]=df["qv"]
         return df
     except: return None
 
@@ -66,26 +66,23 @@ def klines(sym, interval, limit=120):
 def analyze(sym, interval):
     df=klines(sym, interval)
     if df is None or len(df)<40: return None
-    if df["t"].iloc[-1]<250_000: return None
+    if df["turnover"].iloc[-1]<150_000: return None
     c,h,l=df['c'],df['h'],df['l']
-
     rr=float(rsi(c,14).iloc[-1])
     e20,e50=ema(c,20).iloc[-1], ema(c,50).iloc[-1]
     trend_up=e20>e50
     v_ok,ratio=volume_spike(df)
     if not v_ok: return None
-
     if trend_up and rr>50: side="BUY"
     elif not trend_up and rr<50: side="SELL"
     else: return None
-
     a=float(adx(pd.DataFrame({'high':h,'low':l,'close':c}),14).iloc[-1])
     return f"{sym} | {interval.upper()} | {side} | RSI:{rr:.1f} | ADX:{a:.0f} | Hacim x{ratio:.2f}"
 
 # --- ana ---
 def main():
-    syms=mexc_symbols()
-    if not syms: telegram("⚠️ Sembol listesi alınamadı."); return
+    syms=mexc_spot_symbols()
+    if not syms: telegram("⚠️ Sembol listesi alınamadı (MEXC Spot)."); return
 
     signals=[]
     for s in syms:
@@ -94,12 +91,14 @@ def main():
                 res=analyze(s, tf)
                 if res: signals.append(res)
             except: pass
-        time.sleep(0.04)  # daha hızlı tarama
+        time.sleep(0.04)
 
     if signals:
-        msg=f"⚡ *Hızlı Multi-Timeframe Sinyaller*\n⏱ {ts()}\n\n" + "\n".join(signals[:50])
+        msg=f"⚡ *MEXC Spot Multi-Timeframe Sinyaller*\n⏱ {ts()}\nToplam {len(signals)} sinyal bulundu\n\n" + "\n".join(signals[:50])
         telegram(msg)
     else:
-        print("ℹ️ sinyal yok (sessiz geçildi).")
+        msg=f"ℹ️ *{ts()}* - Tarama tamamlandı, sinyal bulunamadı. ({len(syms)} coin tarandı)"
+        telegram(msg)
 
 if __name__=="__main__": main()
+
