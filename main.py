@@ -4,53 +4,53 @@ import requests
 from datetime import datetime, timezone
 
 OKX_BASE = "https://www.okx.com"
-COINGECKO = "https://api.coingecko.com/api/v3"
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 # --- Parametreler ---
 TOP_LIMIT = 150               # En çok hacimli 150 spot USDT coini
-CANDLE_LIMIT_4H = 200
-CANDLE_LIMIT_1H = 120
+BAR = "4H"                    # 4 saatlik sistem
+CANDLE_LIMIT = 200
 TRADES_LIMIT = 200
 ORDERBOOK_DEPTH = 20
 
-# Yapı / filtreler
-STRUCT_LOOKBACK = 30          # 4H MSB/FVG için bakılacak mum sayısı
-BREAK_BUFFER = 0.0025         # ~%0.25 üzeri/altı kırılım
-ZONE_BUFFER = 0.002           # %0.2 marj ile FVG retest
-ORDERBOOK_IMB_RATIO = 1.3     # Bid/Ask notional dengesizliği oranı
+# Fiyat yapısı
+STRUCT_LOOKBACK = 20          # MSB ve FVG için bakılacak mum sayısı
+ZONE_BUFFER = 0.002           # %0.2 marj ile bölge (FVG/MSB değerlendirmesinde)
 
-# Trend sınırları
-EMA_UP = 1.01                 # Fiyat > ema200 * 1.01 → up
-EMA_DOWN = 0.99               # Fiyat < ema200 * 0.99 → down
+# Strateji modu: 4 koşuldan en az 3'ü
+MIN_CONDITIONS_STRICT = 3
 
 
 def ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def jget_raw(url, params=None, retries=3, timeout=10):
-    for _ in range(retries):
-        try:
-            r = requests.get(url, params=params, timeout=timeout)
-            if r.status_code == 200:
-                return r.json()
-        except Exception:
-            time.sleep(0.5)
-    return None
+# ------------ HTTP Yardımcıları ------------
 
-
-def okx_get(path, params=None, retries=3, timeout=10):
-    url = path if path.startswith("http") else OKX_BASE + path
+def jget_okx(path, params=None, retries=3, timeout=10):
+    url = f"{OKX_BASE}{path}"
     for _ in range(retries):
         try:
             r = requests.get(url, params=params, timeout=timeout)
             if r.status_code == 200:
                 j = r.json()
-                if isinstance(j, dict) and j.get("code") == "0":
-                    return j.get("data")
+                if j.get("code") == "0" and j.get("data"):
+                    return j["data"]
+        except Exception:
+            time.sleep(0.5)
+    return None
+
+
+def jget_json(url, params=None, retries=3, timeout=10):
+    """Genel amaçlı JSON GET (CoinGecko vs)"""
+    for _ in range(retries):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            if r.status_code == 200:
+                return r.json()
         except Exception:
             time.sleep(0.5)
     return None
@@ -74,96 +74,106 @@ def telegram(msg: str):
         print("Telegram exception:", e)
 
 
-# ------------ CoinGecko: Marketcap Segmentleri ------------
+# ------------ CoinGecko MCAP Haritası ------------
 
-def load_mcap_segments():
+def load_mcap_map(max_pages: int = 2):
     """
-    CoinGecko'dan marketcap'e göre segment haritası çıkarır.
-    high / mid / low
+    CoinGecko /coins/markets → symbol -> market_cap map
+    En yüksek mcap'i olan symbol kazanır (aynı sembolü kullananlar için).
     """
-    segments = {}
-    data = jget_raw(
-        f"{COINGECKO}/coins/markets",
-        params={
-            "vs_currency": "usd",
-            "order": "market_cap_desc",
-            "per_page": 250,
-            "page": 1,
-            "sparkline": "false",
-        },
-    ) or []
-
-    for row in data:
-        sym = str(row.get("symbol", "")).upper()
-        mcap = row.get("market_cap") or 0
-        if not sym:
-            continue
-        if mcap >= 10_000_000_000:
-            seg = "high"
-        elif mcap >= 1_000_000_000:
-            seg = "mid"
-        else:
-            seg = "low"
-        # aynı sembol birden fazla chain'de olabilir; en büyük mcap'i kullan
-        if sym not in segments:
-            segments[sym] = (mcap, seg)
-        else:
-            if mcap > segments[sym][0]:
-                segments[sym] = (mcap, seg)
-
-    # sadece segment string lazım
-    return {k: v[1] for k, v in segments.items()}
+    mcap_map = {}
+    for page in range(1, max_pages + 1):
+        data = jget_json(
+            f"{COINGECKO_BASE}/coins/markets",
+            params={
+                "vs_currency": "usd",
+                "order": "market_cap_desc",
+                "per_page": 250,
+                "page": page,
+                "sparkline": "false",
+            },
+        )
+        if not data:
+            break
+        for row in data:
+            sym = str(row.get("symbol", "")).upper()
+            mc = row.get("market_cap") or 0
+            if not sym or not mc:
+                continue
+            if sym not in mcap_map or mc > mcap_map[sym]:
+                mcap_map[sym] = mc
+    return mcap_map
 
 
-def get_segment_for_symbol(inst_id, seg_map):
-    base = inst_id.split("-")[0].upper()
-    return seg_map.get(base, "mid")
-
-
-def whale_thresholds(segment):
+def classify_mcap(base: str, mcap_map: dict):
     """
-    S / M / X sınıfları için notional sınırları.
+    HIGH / MID / LOW / MICRO sınıflandırması
     """
-    if segment == "high":
-        return {
-            "S": 500_000,    # orta whale
-            "M": 1_000_000,  # whale
-            "X": 1_500_000,  # süper whale
-        }
-    elif segment == "mid":
-        return {
-            "S": 200_000,
-            "M": 400_000,
-            "X": 800_000,
-        }
-    else:  # low
-        return {
-            "S": 80_000,
-            "M": 150_000,
-            "X": 300_000,
-        }
+    mc = mcap_map.get(base.upper())
+    if mc is None:
+        return "UNKNOWN"
+    if mc >= 10_000_000_000:
+        return "HIGH"
+    if mc >= 1_000_000_000:
+        return "MID"
+    if mc >= 100_000_000:
+        return "LOW"
+    return "MICRO"
 
 
-def delta_thresholds(segment):
+def whale_thresholds(mcap_class: str):
     """
-    Net delta için segment bazlı eşik.
+    MCAP sınıfına göre S/M/X whale eşikleri
+    S: orta, M: büyük, X: süper whale
     """
-    if segment == "high":
-        return 300_000, -300_000
-    elif segment == "mid":
-        return 150_000, -150_000
+    if mcap_class == "HIGH":
+        # BTC, ETH, BNB, SOL, XRP...
+        return 500_000, 1_000_000, 1_500_000
+    elif mcap_class == "MID":
+        # AVAX, LINK, TON, ARB, SUI, HBAR...
+        return 200_000, 400_000, 800_000
+    elif mcap_class == "LOW":
+        # 100M–1B arası
+        return 100_000, 200_000, 400_000
     else:
+        # MICRO / UNKNOWN → biraz daha düşük
+        return 80_000, 150_000, 300_000
+
+
+def net_delta_thresholds(mcap_class: str):
+    """
+    Net delta eşikleri (MCAP'e göre ölçekli)
+    """
+    if mcap_class == "HIGH":
+        return 200_000, -200_000
+    elif mcap_class == "MID":
+        return 100_000, -100_000
+    elif mcap_class == "LOW":
         return 50_000, -50_000
+    else:
+        return 30_000, -30_000
+
+
+def mcap_nice_label(mcap_class: str):
+    if mcap_class == "HIGH":
+        return "🟦 High-cap"
+    if mcap_class == "MID":
+        return "🟧 Mid-cap"
+    if mcap_class == "LOW":
+        return "🟨 Low-cap"
+    if mcap_class == "MICRO":
+        return "🟥 Micro-cap"
+    return "⬜ Unknown-cap"
 
 
 # ------------ OKX Yardımcıları ------------
 
 def get_spot_usdt_top_symbols(limit=TOP_LIMIT):
     """
-    OKX SPOT tickers → USDT pariteleri içinden en yüksek 24h notional hacme göre ilk N'i alır.
+    OKX SPOT tickers → USDT pariteleri içinden en yüksek 24h notional hacme göre ilk 150'yi alır.
     instId formatı: BTC-USDT, HBAR-USDT vs.
     """
-    data = okx_get("/api/v5/market/tickers", {"instType": "SPOT"})
+    data = jget_okx("/api/v5/market/tickers", {"instType": "SPOT"})
     if not data:
         return []
 
@@ -184,8 +194,8 @@ def get_spot_usdt_top_symbols(limit=TOP_LIMIT):
     return symbols
 
 
-def get_candles(inst_id, bar, limit):
-    data = okx_get("/api/v5/market/candles", {"instId": inst_id, "bar": bar, "limit": limit})
+def get_candles(inst_id, bar=BAR, limit=CANDLE_LIMIT):
+    data = jget_okx("/api/v5/market/candles", {"instId": inst_id, "bar": bar, "limit": limit})
     if not data:
         return []
 
@@ -216,12 +226,12 @@ def get_candles(inst_id, bar, limit):
 
 
 def get_trades(inst_id, limit=TRADES_LIMIT):
-    data = okx_get("/api/v5/market/trades", {"instId": inst_id, "limit": limit})
+    data = jget_okx("/api/v5/market/trades", {"instId": inst_id, "limit": limit})
     return data or []
 
 
 def get_orderbook(inst_id, depth=ORDERBOOK_DEPTH):
-    data = okx_get("/api/v5/market/books", {"instId": inst_id, "sz": depth})
+    data = jget_okx("/api/v5/market/books", {"instId": inst_id, "sz": depth})
     if not data:
         return None
 
@@ -256,7 +266,7 @@ def get_orderbook(inst_id, depth=ORDERBOOK_DEPTH):
 
 # ------------ Teknik Hesaplar / Yapı ------------
 
-def ema_list(values, period):
+def ema(values, period):
     if len(values) < period:
         return None
     k = 2 / (period + 1)
@@ -266,19 +276,17 @@ def ema_list(values, period):
     return ema_val
 
 
-def analyze_trades_orderflow(trades, segment):
+def analyze_trades_orderflow(trades, medium_thr, whale_thr, super_thr):
     """
     Spot için:
     - Net notional delta (buy_notional - sell_notional)
-    - En büyük buy whale (S/M/X)
-    - En büyük sell whale (S/M/X)
+    - S / M / X seviyesinde en büyük buy whale
+    - S / M / X seviyesinde en büyük sell whale
     """
-    thr = whale_thresholds(segment)
-
     buy_notional = 0.0
     sell_notional = 0.0
-    top_buy = None
-    top_sell = None
+    best_buy = None
+    best_sell = None
 
     for t in trades:
         try:
@@ -289,61 +297,72 @@ def analyze_trades_orderflow(trades, segment):
             continue
 
         notional = px * abs(sz)
+
+        # Whale tier belirle
+        tier = None
+        if notional >= super_thr:
+            tier = "X"
+        elif notional >= whale_thr:
+            tier = "M"
+        elif notional >= medium_thr:
+            tier = "S"
+
         if side == "buy":
             buy_notional += notional
-            cls = None
-            if notional >= thr["X"]:
-                cls = "X"
-            elif notional >= thr["M"]:
-                cls = "M"
-            elif notional >= thr["S"]:
-                cls = "S"
-            if cls:
-                if (top_buy is None) or (notional > top_buy["usd"]):
-                    top_buy = {
+            if tier:
+                if (best_buy is None) or (notional > best_buy["usd"]):
+                    best_buy = {
                         "px": px,
                         "sz": sz,
                         "usd": notional,
-                        "class": cls,
-                        "side": "buy",
+                        "side": side,
+                        "tier": tier,
                         "ts": t.get("ts"),
                     }
         elif side == "sell":
             sell_notional += notional
-            cls = None
-            if notional >= thr["X"]:
-                cls = "X"
-            elif notional >= thr["M"]:
-                cls = "M"
-            elif notional >= thr["S"]:
-                cls = "S"
-            if cls:
-                if (top_sell is None) or (notional > top_sell["usd"]):
-                    top_sell = {
+            if tier:
+                if (best_sell is None) or (notional > best_sell["usd"]):
+                    best_sell = {
                         "px": px,
                         "sz": sz,
                         "usd": notional,
-                        "class": cls,
-                        "side": "sell",
+                        "side": side,
+                        "tier": tier,
                         "ts": t.get("ts"),
                     }
 
     net_delta = buy_notional - sell_notional
+
     return {
         "buy_notional": buy_notional,
         "sell_notional": sell_notional,
         "net_delta": net_delta,
-        "buy_whale": top_buy,
-        "sell_whale": top_sell,
-        "has_buy_whale": top_buy is not None,
-        "has_sell_whale": top_sell is not None,
-        "segment": segment,
+        "buy_whale": best_buy,
+        "sell_whale": best_sell,
+        "has_buy_whale": best_buy is not None,
+        "has_sell_whale": best_sell is not None,
     }
 
 
-# ---- Market Structure Break (4H) ----
+def tier_nice_label(tier: str):
+    if tier == "S":
+        return "S (Orta whale)"
+    if tier == "M":
+        return "M (Büyük whale)"
+    if tier == "X":
+        return "X (Süper whale)"
+    return "-"
+
+
+# ---- Market Structure Break (MSB) ----
 
 def detect_bullish_msb(candles, lookback=STRUCT_LOOKBACK):
+    """
+    Basit bullish MSB:
+    - Son lookback içindeki en yüksek kapanış alınır
+    - Son mum bu seviyenin %0.1 üstünde kapanmışsa bullish break
+    """
     if len(candles) < lookback + 2:
         return False, None
 
@@ -351,12 +370,17 @@ def detect_bullish_msb(candles, lookback=STRUCT_LOOKBACK):
     level = max(closes)
     last_close = candles[-1]["close"]
 
-    if last_close > level * (1 + BREAK_BUFFER):
+    if last_close > level * 1.001:
         return True, level
     return False, level
 
 
 def detect_bearish_msb(candles, lookback=STRUCT_LOOKBACK):
+    """
+    Basit bearish MSB:
+    - Son lookback içindeki en düşük kapanış alınır
+    - Son mum bu seviyenin %0.1 altına kırdıysa bearish break
+    """
     if len(candles) < lookback + 2:
         return False, None
 
@@ -364,18 +388,20 @@ def detect_bearish_msb(candles, lookback=STRUCT_LOOKBACK):
     level = min(closes)
     last_close = candles[-1]["close"]
 
-    if last_close < level * (1 - BREAK_BUFFER):
+    if last_close < level * 0.999:
         return True, level
     return False, level
 
 
-# ---- Basit FVG (4H) ----
+# ---- FVG (Fair Value Gap) Tespiti ----
 
 def find_recent_fvg(candles, lookback=STRUCT_LOOKBACK):
     """
-    Basit FVG:
-      Bullish: high(i-2) < low(i)
-      Bearish: low(i-2) > high(i)
+    Basitleştirilmiş FVG:
+    - i-2 ve i mumları arasında gap varsa:
+      Bullish FVG: high(i-2) < low(i) → gap aşağıda, destek bölgesi
+      Bearish FVG: low(i-2) > high(i) → gap yukarıda, direnç bölgesi
+    Son lookback içinde en son görülen FVG'yi döndürür.
     """
     n = len(candles)
     if n < 3:
@@ -388,24 +414,35 @@ def find_recent_fvg(candles, lookback=STRUCT_LOOKBACK):
         c1 = candles[i - 2]
         c3 = candles[i]
 
+        # Bullish FVG (gap aşağıda)
         if c1["high"] < c3["low"]:
+            zone_low = c1["high"]
+            zone_high = c3["low"]
             last_fvg = {
                 "type": "bullish",
-                "low": c1["high"],
-                "high": c3["low"],
+                "low": zone_low,
+                "high": zone_high,
             }
 
+        # Bearish FVG (gap yukarıda)
         if c1["low"] > c3["high"]:
+            zone_low = c3["high"]
+            zone_high = c1["low"]
             last_fvg = {
                 "type": "bearish",
-                "low": c3["high"],
-                "high": c1["low"],
+                "low": zone_low,
+                "high": zone_high,
             }
 
     return last_fvg
 
 
 def check_fvg_rejection(candles, fvg):
+    """
+    Son mum için FVG rejection kontrolü:
+    - Bullish: son mum fitili FVG içine girip, FVG üstünden kapanmışsa (veya en azından içinde yukarı yönlü)
+    - Bearish: son mum fitili FVG içine girip, FVG altından kapanmışsa (veya içinde aşağı yönlü)
+    """
     if not fvg or len(candles) < 1:
         return False
 
@@ -418,15 +455,18 @@ def check_fvg_rejection(candles, fvg):
     z_low = fvg["low"]
     z_high = fvg["high"]
 
+    # mum FVG bölgesine değmiş mi?
     touched = not (high < z_low or low > z_high)
     if not touched:
         return False
 
+    # bullish FVG rejection
     if fvg["type"] == "bullish":
         if close > op and close > (z_low * (1 + ZONE_BUFFER / 2)):
             return True
         return False
 
+    # bearish FVG rejection
     if fvg["type"] == "bearish":
         if close < op and close < (z_high * (1 - ZONE_BUFFER / 2)):
             return True
@@ -435,93 +475,163 @@ def check_fvg_rejection(candles, fvg):
     return False
 
 
-# -------- 1H Onay (trend + son durum) --------
+# ------------ Sembol Analizi (LONG + SHORT) ------------
 
-def confirm_long_1h(candles_1h):
-    if len(candles_1h) < 60:
-        return False
-    closes = [c["close"] for c in candles_1h]
-    ema20 = ema_list(closes, 20)
-    ema50 = ema_list(closes, 50)
-    last = closes[-1]
+def analyze_symbol(inst_id, mcap_map):
+    """
+    Tek coin için:
+    - MCAP sınıfı → HIGH/MID/LOW/MICRO
+    - FVG + MSB yapısı
+    - Orderflow + S/M/X whale + orderbook + net delta ile filtre
+    Hem LONG hem SHORT sinyalleri döndürür.
+    """
+    candles = get_candles(inst_id)
+    if len(candles) < STRUCT_LOOKBACK + 3:
+        return []
 
-    if ema20 is None or ema50 is None:
-        return False
+    last = candles[-1]
 
-    # Trend yukarı + fiyat EMA50 üstünde
-    if ema20 > ema50 and last > ema50:
-        # Son 3 mumda % -2'den fazla ters hareket olmaması
-        if len(closes) >= 4:
-            ref = closes[-4]
-            change = (last / ref) - 1.0
-            if change < -0.02:
-                return False
-        return True
-    return False
+    base = inst_id.split("-")[0]
+    mcap_class = classify_mcap(base, mcap_map)
+    medium_thr, whale_thr, super_thr = whale_thresholds(mcap_class)
+    nd_pos_thr, nd_neg_thr = net_delta_thresholds(mcap_class)
+
+    trades = get_trades(inst_id)
+    if not trades:
+        return []
+
+    of = analyze_trades_orderflow(trades, medium_thr, whale_thr, super_thr)
+    book = get_orderbook(inst_id)
+    if not book:
+        return []
+
+    bid_n = book["bid_notional"]
+    ask_n = book["ask_notional"]
+
+    # Yapı: MSB + FVG
+    bullish_msb, bull_level = detect_bullish_msb(candles)
+    bearish_msb, bear_level = detect_bearish_msb(candles)
+    fvg = find_recent_fvg(candles)
+
+    bullish_fvg_reject = False
+    bearish_fvg_reject = False
+    if fvg:
+        rej = check_fvg_rejection(candles, fvg)
+        if rej and fvg["type"] == "bullish":
+            bullish_fvg_reject = True
+        if rej and fvg["type"] == "bearish":
+            bearish_fvg_reject = True
+
+    structure_long = bullish_msb or bullish_fvg_reject
+    structure_short = bearish_msb or bearish_fvg_reject
+
+    signals = []
+
+    # ---------- LONG ---------
+    if structure_long:
+        cond_struct = True
+        cond_delta = of["net_delta"] >= nd_pos_thr
+        cond_ob = bid_n > ask_n * 1.3
+        cond_whale = of["has_buy_whale"]
+
+        conds = [cond_struct, cond_delta, cond_ob, cond_whale]
+        true_count = sum(conds)
+
+        if true_count >= MIN_CONDITIONS_STRICT:
+            confidence = int((true_count / 4) * 100)
+            signal = {
+                "inst_id": inst_id,
+                "side": "LONG",
+                "last_close": last["close"],
+                "orderflow": of,
+                "orderbook": book,
+                "confidence": confidence,
+                "structure": {
+                    "bull_msb": bullish_msb,
+                    "bull_level": bull_level,
+                    "bull_fvg_reject": bullish_fvg_reject,
+                    "mcap_class": mcap_class,
+                },
+            }
+            signals.append(signal)
+
+    # ---------- SHORT ---------
+    if structure_short:
+        cond_struct_s = True
+        cond_delta_s = of["net_delta"] <= nd_neg_thr
+        cond_ob_s = ask_n > bid_n * 1.3
+        cond_whale_s = of["has_sell_whale"]
+
+        conds_s = [cond_struct_s, cond_delta_s, cond_ob_s, cond_whale_s]
+        true_count_s = sum(conds_s)
+
+        if true_count_s >= MIN_CONDITIONS_STRICT:
+            confidence_s = int((true_count_s / 4) * 100)
+            signal = {
+                "inst_id": inst_id,
+                "side": "SHORT",
+                "last_close": last["close"],
+                "orderflow": of,
+                "orderbook": book,
+                "confidence": confidence_s,
+                "structure": {
+                    "bear_msb": bearish_msb,
+                    "bear_level": bear_level,
+                    "bear_fvg_reject": bearish_fvg_reject,
+                    "mcap_class": mcap_class,
+                },
+            }
+            signals.append(signal)
+
+    return signals
 
 
-def confirm_short_1h(candles_1h):
-    if len(candles_1h) < 60:
-        return False
-    closes = [c["close"] for c in candles_1h]
-    ema20 = ema_list(closes, 20)
-    ema50 = ema_list(closes, 50)
-    last = closes[-1]
+# ------------ BTC & ETH Piyasa Özeti ------------
 
-    if ema20 is None or ema50 is None:
-        return False
-
-    # Trend aşağı + fiyat EMA50 altında
-    if ema20 < ema50 and last < ema50:
-        if len(closes) >= 4:
-            ref = closes[-4]
-            change = (last / ref) - 1.0
-            if change > 0.02:
-                return False
-        return True
-    return False
-
-
-# ------------ BTC & ETH Trend Özeti ------------
-
-def get_trend_summary(inst_id, segment="high"):
-    candles = get_candles(inst_id, bar="4H", limit=CANDLE_LIMIT_4H)
+def get_trend_summary(inst_id, mcap_map):
+    candles = get_candles(inst_id)
     if len(candles) < 50:
         return None
 
     closes = [c["close"] for c in candles]
     last = closes[-1]
 
-    ema50 = ema_list(closes, 50)
-    ema200 = ema_list(closes, 200)
+    ema200 = ema(closes, 200) if len(closes) >= 200 else None
+    ema_fast = ema(closes, 12)
+    ema_slow = ema(closes, 26)
 
+    macd = None
+    if ema_fast is not None and ema_slow is not None:
+        macd = ema_fast - ema_slow
+
+    base = inst_id.split("-")[0]
+    mcap_class = classify_mcap(base, mcap_map)
+    medium_thr, whale_thr, super_thr = whale_thresholds(mcap_class)
+
+    trades = get_trades(inst_id)
+    of = analyze_trades_orderflow(trades, medium_thr, whale_thr, super_thr) if trades else None
+
+    # Trend yorumu
     if ema200 is None:
         trend_txt = "Veri az"
-        trend_dir = "range"
     else:
-        if last > ema200 * EMA_UP:
+        if last > ema200 * 1.01:
             trend_txt = "Yukarı"
-            trend_dir = "up"
-        elif last < ema200 * EMA_DOWN:
+        elif last < ema200 * 0.99:
             trend_txt = "Aşağı"
-            trend_dir = "down"
         else:
             trend_txt = "Yatay"
-            trend_dir = "range"
 
-    # Basit momentum: ema50 vs ema200
-    if ema50 is None or ema200 is None:
+    # Momentum yorumu
+    if macd is None:
         mom_txt = "Bilinmiyor"
     else:
-        if ema50 > ema200:
+        if macd > 0:
             mom_txt = "Pozitif"
-        elif ema50 < ema200:
+        elif macd < 0:
             mom_txt = "Negatif"
         else:
             mom_txt = "Düz"
-
-    trades = get_trades(inst_id)
-    of = analyze_trades_orderflow(trades, segment) if trades else None
 
     whale_txt = "Veri yok"
     delta_txt = "Veri yok"
@@ -530,192 +640,29 @@ def get_trend_summary(inst_id, segment="high"):
         delta_txt = f"Net delta: {of['net_delta']:.0f} USDT"
         w = of["buy_whale"]
         if w:
-            whale_txt = f"Whale BUY: {w['class']} ~${w['usd']:,.0f}"
+            whale_txt = f"Whale: {tier_nice_label(w['tier'])} ~${w['usd']:,.0f}"
         else:
-            whale_txt = "Whale BUY yok"
+            whale_txt = "Anlamlı BUY whale yok"
 
     return {
         "inst_id": inst_id,
         "last": last,
         "trend": trend_txt,
-        "trend_dir": trend_dir,
         "momentum": mom_txt,
         "delta_txt": delta_txt,
         "whale_txt": whale_txt,
+        "mcap_class": mcap_class,
     }
-
-
-# ------------ Sembol Analizi (4H + 1H) ------------
-
-def analyze_symbol(inst_id, segment, btc_trend_dir):
-    """
-    Tek coin için:
-    - 4H MSB + FVG yapısı
-    - 1H trend onayı
-    - Orderflow + whale + orderbook filtreleri
-    Hem LONG hem SHORT sinyalleri döndürür.
-    """
-    candles_4h = get_candles(inst_id, bar="4H", limit=CANDLE_LIMIT_4H)
-    if len(candles_4h) < STRUCT_LOOKBACK + 5:
-        return []
-
-    last_4h = candles_4h[-1]
-    closes_4h = [c["close"] for c in candles_4h]
-    ema50_4h = ema_list(closes_4h, 50)
-    ema200_4h = ema_list(closes_4h, 200)
-
-    pair_trend = "range"
-    if ema200_4h is not None:
-        if last_4h["close"] > ema200_4h * EMA_UP:
-            pair_trend = "up"
-        elif last_4h["close"] < ema200_4h * EMA_DOWN:
-            pair_trend = "down"
-
-    trades = get_trades(inst_id)
-    if not trades:
-        return []
-
-    of = analyze_trades_orderflow(trades, segment)
-    book = get_orderbook(inst_id)
-    if not book:
-        return []
-
-    bid_n = book["bid_notional"]
-    ask_n = book["ask_notional"]
-
-    fvg = find_recent_fvg(candles_4h)
-    bullish_msb, bull_level = detect_bullish_msb(candles_4h)
-    bearish_msb, bear_level = detect_bearish_msb(candles_4h)
-
-    bullish_fvg_reject = False
-    bearish_fvg_reject = False
-    if fvg:
-        rej = check_fvg_rejection(candles_4h, fvg)
-        if rej and fvg["type"] == "bullish":
-            bullish_fvg_reject = True
-        if rej and fvg["type"] == "bearish":
-            bearish_fvg_reject = True
-
-    structure_long_4h = bullish_msb or bullish_fvg_reject
-    structure_short_4h = bearish_msb or bearish_fvg_reject
-
-    # 1H onay
-    candles_1h = get_candles(inst_id, bar="1H", limit=CANDLE_LIMIT_1H)
-    if not candles_1h:
-        return []
-
-    confirm_long = confirm_long_1h(candles_1h)
-    confirm_short = confirm_short_1h(candles_1h)
-
-    structure_long = structure_long_4h and confirm_long
-    structure_short = structure_short_4h and confirm_short
-
-    delta_pos_thr, delta_neg_thr = delta_thresholds(segment)
-
-    signals = []
-
-    # ---------- LONG ---------
-    if structure_long:
-        # Global trend filtresi: BTC DOWN iken agresif LONG istemiyoruz
-        if btc_trend_dir != "down" and pair_trend != "down":
-            cond_struct = True
-            cond_delta = of["net_delta"] >= delta_pos_thr
-            cond_ob = bid_n > ask_n * ORDERBOOK_IMB_RATIO
-            cond_whale = of["has_buy_whale"]
-
-            conds = [cond_struct, cond_delta, cond_ob, cond_whale]
-            true_count = sum(conds)
-
-            if true_count >= 3:
-                confidence = int((true_count / 4) * 100)
-                signal = {
-                    "inst_id": inst_id,
-                    "side": "LONG",
-                    "last_close": last_4h["close"],
-                    "orderflow": of,
-                    "orderbook": book,
-                    "confidence": confidence,
-                    "structure": {
-                        "bull_msb": bullish_msb,
-                        "bull_level": bull_level,
-                        "bull_fvg_reject": bullish_fvg_reject,
-                    },
-                    "segment": segment,
-                    "pair_trend": pair_trend,
-                }
-                signals.append(signal)
-
-    # ---------- SHORT ---------
-    if structure_short:
-        # Global trend filtresi: SHORT sadece BTC trend "down" iken
-        if btc_trend_dir == "down" and pair_trend == "down":
-            cond_struct_s = True
-            cond_delta_s = of["net_delta"] <= delta_neg_thr
-            cond_ob_s = ask_n > bid_n * ORDERBOOK_IMB_RATIO
-            cond_whale_s = of["has_sell_whale"]
-
-            conds_s = [cond_struct_s, cond_delta_s, cond_ob_s, cond_whale_s]
-            true_count_s = sum(conds_s)
-
-            if true_count_s >= 3:
-                confidence_s = int((true_count_s / 4) * 100)
-                signal = {
-                    "inst_id": inst_id,
-                    "side": "SHORT",
-                    "last_close": last_4h["close"],
-                    "orderflow": of,
-                    "orderbook": book,
-                    "confidence": confidence_s,
-                    "structure": {
-                        "bear_msb": bearish_msb,
-                        "bear_level": bear_level,
-                        "bear_fvg_reject": bearish_fvg_reject,
-                    },
-                    "segment": segment,
-                    "pair_trend": pair_trend,
-                }
-                signals.append(signal)
-
-    return signals
 
 
 # ------------ Telegram Mesajı ------------
 
-def whale_explanation(of, side, segment):
-    thresholds = whale_thresholds(segment)
-    label_map = {
-        "S": "S (orta whale)",
-        "M": "M (büyük whale)",
-        "X": "X (süper whale)",
-    }
-    if side == "LONG":
-        w = of["buy_whale"]
-    else:
-        w = of["sell_whale"]
-
-    if not w:
-        return "Whale yok"
-
-    cls = w.get("class")
-    cls_label = label_map.get(cls, cls)
-    base_txt = f"{cls_label} ~${w['usd']:,.0f} @ {w['px']:.4f}"
-
-    if segment == "high":
-        seg_txt = "High-cap coin için bu hacim güçlü ama tek başına trendi çevirmek zorunda değil."
-    elif segment == "mid":
-        seg_txt = "Mid-cap coinlerde bu büyüklük, yön değiştirebilecek seviyede ciddi bir işlem."
-    else:
-        seg_txt = "Low-cap coinlerde bu hacim grafiği tek başına bile sert oynatabilir."
-
-    return base_txt + " — " + seg_txt
-
-
 def build_telegram_message(btc_info, eth_info, signals):
     lines = []
-    lines.append(f"*📊 Piyasa Trendi (4H + 1H Onay – OKX)*")
+    lines.append(f"*📊 Piyasa Trendi (4H – OKX)*")
 
     if btc_info:
-        lines.append(f"\n*BTC-USDT*")
+        lines.append(f"\n*BTC-USDT* {mcap_nice_label(btc_info['mcap_class'])}")
         lines.append(f"- Fiyat: `{btc_info['last']:.2f}`")
         lines.append(f"- Trend: *{btc_info['trend']}*")
         lines.append(f"- Momentum: *{btc_info['momentum']}*")
@@ -723,50 +670,72 @@ def build_telegram_message(btc_info, eth_info, signals):
         lines.append(f"- {btc_info['whale_txt']}")
 
     if eth_info:
-        lines.append(f"\n*ETH-USDT*")
+        lines.append(f"\n*ETH-USDT* {mcap_nice_label(eth_info['mcap_class'])}")
         lines.append(f"- Fiyat: `{eth_info['last']:.2f}`")
         lines.append(f"- Trend: *{eth_info['trend']}*")
         lines.append(f"- Momentum: *{eth_info['momentum']}*")
         lines.append(f"- {eth_info['delta_txt']}")
         lines.append(f"- {eth_info['whale_txt']}")
 
-    lines.append(f"\n*🚀 4H Sinyaller (Top {TOP_LIMIT} USDT Spot, 1H Onaylı)*")
+    lines.append(f"\n*🚀 4H Giriş Sinyalleri (Top {TOP_LIMIT} USDT Spot)*")
+
     if not signals:
         lines.append("_Bu taramada sinyal yok._")
-    else:
-        for s in signals:
-            of = s["orderflow"]
-            book = s["orderbook"]
-            seg = s["segment"]
+        lines.append(
+            "\nWhale kodları: `S=orta`, `M=büyük`, `X=süper` (coin MCAP'ine göre hesaplanır)"
+        )
+        lines.append(f"\n_Zaman:_ `{ts()}`")
+        return "\n".join(lines)
 
-            seg_label = {"high": "High-cap", "mid": "Mid-cap", "low": "Low-cap"}.get(seg, seg)
-            whale_str = whale_explanation(of, s["side"], seg)
+    big_whale_seen = False
 
+    for s in signals:
+        of = s["orderflow"]
+        book = s["orderbook"]
+        mcap_class = s["structure"].get("mcap_class", "UNKNOWN")
+
+        if s["side"] == "LONG":
+            w = of["buy_whale"]
             struct_txt = []
-            if s["side"] == "LONG":
-                if s["structure"].get("bull_msb"):
-                    struct_txt.append("Bullish MSB")
-                if s["structure"].get("bull_fvg_reject"):
-                    struct_txt.append("Bullish FVG retest")
-            else:
-                if s["structure"].get("bear_msb"):
-                    struct_txt.append("Bearish MSB")
-                if s["structure"].get("bear_fvg_reject"):
-                    struct_txt.append("Bearish FVG retest")
+            if s["structure"].get("bull_msb"):
+                struct_txt.append("Bullish MSB")
+            if s["structure"].get("bull_fvg_reject"):
+                struct_txt.append("Bullish FVG retest")
+        else:
+            w = of["sell_whale"]
+            struct_txt = []
+            if s["structure"].get("bear_msb"):
+                struct_txt.append("Bearish MSB")
+            if s["structure"].get("bear_fvg_reject"):
+                struct_txt.append("Bearish FVG retest")
 
-            struct_str = ", ".join(struct_txt) if struct_txt else "Yapı: N/A"
+        struct_str = ", ".join(struct_txt) if struct_txt else "Yapı: N/A"
 
-            lines.append(f"\n*{s['inst_id']} ({s['side']})*")
-            lines.append(f"- Segment: `{seg_label}`")
-            lines.append(f"- 4H kapanış: `{s['last_close']:.4f}`")
-            lines.append(f"- 4H Yapı: {struct_str}")
-            lines.append(f"- Net delta: `{of['net_delta']:.0f} USDT`")
-            lines.append(f"- Whale: {whale_str}")
+        lines.append(f"\n*{s['inst_id']} ({s['side']})* {mcap_nice_label(mcap_class)}")
+        lines.append(f"- Kapanış: `{s['last_close']:.4f}`")
+        lines.append(f"- Yapı: {struct_str}")
+        lines.append(f"- Net delta: `{of['net_delta']:.0f} USDT`")
+        lines.append(
+            f"- Orderbook (Bid/Ask notional): `{book['bid_notional']:.0f} / {book['ask_notional']:.0f}`"
+        )
+        lines.append(f"- Güven puanı: *%{s['confidence']}*")
+
+        if w:
             lines.append(
-                f"- Orderbook (Bid/Ask notional): `{book['bid_notional']:.0f} / {book['ask_notional']:.0f}`"
+                f"- Whale: {tier_nice_label(w['tier'])} ~`${w['usd']:,.0f}` @ {w['px']:.4f}"
             )
-            lines.append(f"- Çift trendi (4H): `{s['pair_trend']}`")
-            lines.append(f"- Güven puanı: *%{s['confidence']}*")
+            big_whale_seen = True
+        else:
+            lines.append(f"- Whale: Yok (bu coinde anlamlı S/M/X trade yok)")
+
+    if big_whale_seen:
+        lines.append(
+            "\nWhale kodları: `S=orta`, `M=büyük`, `X=süper` — seviyeler coin'in piyasa değerine göre hesaplanır."
+        )
+    else:
+        lines.append(
+            "\nWhale yoksa bile yapı + delta + orderbook birlikte sinyal üretiyor. Kademeli giriş düşünülmeli."
+        )
 
     lines.append(f"\n_Zaman:_ `{ts()}`")
     return "\n".join(lines)
@@ -777,13 +746,16 @@ def build_telegram_message(btc_info, eth_info, signals):
 def main():
     print(f"[{ts()}] Bot çalışıyor...")
 
-    seg_map = load_mcap_segments()
+    # MCAP haritası (CoinGecko)
+    print("CoinGecko market cap verisi çekiliyor...")
+    mcap_map = load_mcap_map()
+    print(f"MCAP haritası yüklendi. Sembol sayısı: {len(mcap_map)}")
 
-    btc_info = get_trend_summary("BTC-USDT", segment="high")
-    eth_info = get_trend_summary("ETH-USDT", segment="high")
+    # BTC & ETH piyasa özeti
+    btc_info = get_trend_summary("BTC-USDT", mcap_map)
+    eth_info = get_trend_summary("ETH-USDT", mcap_map)
 
-    btc_trend_dir = btc_info["trend_dir"] if btc_info else "range"
-
+    # Top 150 USDT spot listesi (OKX hacme göre)
     symbols = get_spot_usdt_top_symbols(limit=TOP_LIMIT)
     if not symbols:
         print("Top USDT listesi alınamadı.")
@@ -795,17 +767,16 @@ def main():
     for i, inst_id in enumerate(symbols, start=1):
         print(f"[{i}/{len(symbols)}] {inst_id} analiz ediliyor...")
         try:
-            segment = get_segment_for_symbol(inst_id, seg_map)
-            sigs = analyze_symbol(inst_id, segment, btc_trend_dir)
+            sigs = analyze_symbol(inst_id, mcap_map)
             if sigs:
                 for s in sigs:
                     print(
-                        f"  → Sinyal bulundu: {inst_id} ({s['side']})  Segment:{segment}  Güven %{s['confidence']}"
+                        f"  → Sinyal bulundu: {inst_id} ({s['side']})  Güven %{s['confidence']}"
                     )
                 all_signals.extend(sigs)
         except Exception as e:
             print(f"  {inst_id} analiz hatası:", e)
-        time.sleep(0.2)  # çok hızlı istek atıp ban yememek için küçük bekleme
+        time.sleep(0.15)  # çok hızlı istek atıp ban yememek için küçük bekleme
 
     if not all_signals:
         print("Bu turda sinyal yok. Telegram'a mesaj gönderilmeyecek.")
