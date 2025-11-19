@@ -23,6 +23,11 @@ ZONE_BUFFER = 0.002           # %0.2 marj ile bölge (FVG/MSB değerlendirmesind
 # Strateji modu: 4 koşuldan en az 3'ü
 MIN_CONDITIONS_STRICT = 3
 
+# --- Ek güvenlik parametreleri (senin zarardan bıktığın kısımlar için) ---
+MAX_STRUCTURE_DISTANCE = 0.01     # MSB/FVG seviyesinden max %1 uzaklık
+MAX_WHALE_DISTANCE = 0.008        # Whale fiyatından max %0.8 uzaklık
+MAX_WHALE_AGE_MIN = 240           # Whale işlemi max 240 dakika (4H) eski olabilir
+
 
 def ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -475,6 +480,25 @@ def check_fvg_rejection(candles, fvg):
     return False
 
 
+# ------------ Yardımcı: Whale yaşı (dakika) ------------
+
+def whale_age_minutes(whale, last_candle_ts_ms):
+    """
+    Whale işleminin son mum zamanına göre kaç dakika önce olduğunu döndürür.
+    """
+    if not whale:
+        return None
+    ts_val = whale.get("ts")
+    if not ts_val:
+        return None
+    try:
+        w_ts = int(ts_val)
+        diff_ms = last_candle_ts_ms - w_ts
+        return diff_ms / 1000 / 60
+    except Exception:
+        return None
+
+
 # ------------ Sembol Analizi (LONG + SHORT) ------------
 
 def analyze_symbol(inst_id, mcap_map):
@@ -484,12 +508,20 @@ def analyze_symbol(inst_id, mcap_map):
     - FVG + MSB yapısı
     - Orderflow + S/M/X whale + orderbook + net delta ile filtre
     Hem LONG hem SHORT sinyalleri döndürür.
+
+    Bu versiyonda:
+    - MSB/FVG seviyesinden çok uzaklaşmış sinyaller elenir
+    - Whale fiyatından çok uzaklaşmış sinyaller elenir
+    - Whale işlemi çok eskiyse (4H+) sinyal elenir
+    Böylece tepeden/dipten geç gelen sinyaller büyük oranda süzülür.
     """
     candles = get_candles(inst_id)
     if len(candles) < STRUCT_LOOKBACK + 3:
         return []
 
     last = candles[-1]
+    last_close = last["close"]
+    last_ts = last["ts"]
 
     base = inst_id.split("-")[0]
     mcap_class = classify_mcap(base, mcap_map)
@@ -525,14 +557,67 @@ def analyze_symbol(inst_id, mcap_map):
     structure_long = bullish_msb or bullish_fvg_reject
     structure_short = bearish_msb or bearish_fvg_reject
 
+    # --- EK GÜVENLİK 1: Yapı (MSB / FVG) seviyesinden çok uzaksa LONG/SHORT iptal ---
+
+    if structure_long:
+        ref_level = None
+        # Önce MSB seviyesi
+        if bullish_msb and bull_level:
+            ref_level = bull_level
+        # MSB yoksa, FVG seviyesinin ortasını referans al
+        elif bullish_fvg_reject and fvg and fvg["type"] == "bullish":
+            ref_level = (fvg["low"] + fvg["high"]) / 2.0
+
+        if ref_level:
+            dist = abs(last_close - ref_level) / ref_level
+            if dist > MAX_STRUCTURE_DISTANCE:
+                # Fiyat yapıya göre çok yürümüş → geç sinyal → iptal
+                structure_long = False
+
+    if structure_short:
+        ref_level_s = None
+        if bearish_msb and bear_level:
+            ref_level_s = bear_level
+        elif bearish_fvg_reject and fvg and fvg["type"] == "bearish":
+            ref_level_s = (fvg["low"] + fvg["high"]) / 2.0
+
+        if ref_level_s:
+            dist_s = abs(last_close - ref_level_s) / ref_level_s
+            if dist_s > MAX_STRUCTURE_DISTANCE:
+                # Fiyat yapıya göre çok uzak → tepeden/dipten işlem açma
+                structure_short = False
+
     signals = []
 
     # ---------- LONG ---------
     if structure_long:
         cond_struct = True
+
+        # Net delta şartı
         cond_delta = of["net_delta"] >= nd_pos_thr
+
+        # Orderbook baskısı şartı
         cond_ob = bid_n > ask_n * 1.3
-        cond_whale = of["has_buy_whale"]
+
+        # Whale şartı + EK GÜVENLİK (fiyat yakınlığı + tazelik)
+        w_buy = of["buy_whale"]
+        cond_whale = False
+        if w_buy:
+            # Whale fiyatına uzaklık
+            try:
+                whale_px = float(w_buy["px"])
+                whale_dist = abs(last_close - whale_px) / whale_px
+            except Exception:
+                whale_dist = None
+
+            # Whale yaşı (dakika)
+            age_min = whale_age_minutes(w_buy, last_ts)
+
+            near_enough = (whale_dist is not None and whale_dist <= MAX_WHALE_DISTANCE)
+            fresh_enough = (age_min is None) or (age_min <= MAX_WHALE_AGE_MIN)
+
+            if near_enough and fresh_enough:
+                cond_whale = True
 
         conds = [cond_struct, cond_delta, cond_ob, cond_whale]
         true_count = sum(conds)
@@ -542,7 +627,7 @@ def analyze_symbol(inst_id, mcap_map):
             signal = {
                 "inst_id": inst_id,
                 "side": "LONG",
-                "last_close": last["close"],
+                "last_close": last_close,
                 "orderflow": of,
                 "orderbook": book,
                 "confidence": confidence,
@@ -558,9 +643,30 @@ def analyze_symbol(inst_id, mcap_map):
     # ---------- SHORT ---------
     if structure_short:
         cond_struct_s = True
+
+        # Net delta şartı
         cond_delta_s = of["net_delta"] <= nd_neg_thr
+
+        # Orderbook baskısı şartı
         cond_ob_s = ask_n > bid_n * 1.3
-        cond_whale_s = of["has_sell_whale"]
+
+        # Whale şartı + EK GÜVENLİK (fiyat yakınlığı + tazelik)
+        w_sell = of["sell_whale"]
+        cond_whale_s = False
+        if w_sell:
+            try:
+                whale_px_s = float(w_sell["px"])
+                whale_dist_s = abs(last_close - whale_px_s) / whale_px_s
+            except Exception:
+                whale_dist_s = None
+
+            age_min_s = whale_age_minutes(w_sell, last_ts)
+
+            near_enough_s = (whale_dist_s is not None and whale_dist_s <= MAX_WHALE_DISTANCE)
+            fresh_enough_s = (age_min_s is None) or (age_min_s <= MAX_WHALE_AGE_MIN)
+
+            if near_enough_s and fresh_enough_s:
+                cond_whale_s = True
 
         conds_s = [cond_struct_s, cond_delta_s, cond_ob_s, cond_whale_s]
         true_count_s = sum(conds_s)
@@ -570,7 +676,7 @@ def analyze_symbol(inst_id, mcap_map):
             signal = {
                 "inst_id": inst_id,
                 "side": "SHORT",
-                "last_close": last["close"],
+                "last_close": last_close,
                 "orderflow": of,
                 "orderbook": book,
                 "confidence": confidence_s,
